@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Import / Export Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="layout">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <h2>Categories</h2>
+    <ul id="categoryList">
+      <li data-category="" class="active">All Categories</li>
+      <li data-category="grains">Grains</li>
+      <li data-category="vegetables">Vegetables</li>
+      <li data-category="raw_materials">Raw Materials</li>
+      <li data-category="others">Others</li>
+    </ul>
+    <p class="sidebar-note">
+      Click a category to see combined quantity now vs 2026 for that group.
+      2026 quantities include +20% for food groups, -8% for raw materials,
+      and -10% for other products.
+    </p>
+  </aside>
+
+  <!-- Main content -->
+  <main class="main-content">
+    <div class="container">
+      <h1>International Trade Dashboard</h1>
+
+      <div class="search-panel">
+        <input id="productInput" type="text" placeholder="Search product, e.g. rice, IC ENGINES" />
+        <select id="typeSelect">
+          <option value="import">Import</option>
+          <option value="export">Export</option>
+        </select>
+        <button id="searchBtn">Search</button>
+      </div>
+
+      <div id="message" class="message"></div>
+      <div id="gstInfo" class="message"></div>
+
+      <div class="summary-cards">
+        <div class="card">
+          <h3>Total Quantity</h3>
+          <p id="totalQuantity">–</p>
+        </div>
+        <div class="card">
+          <h3>Total Value (US$M)</h3>
+          <p id="totalValue">–</p>
+        </div>
+      </div>
+
+      <!-- XGBoost prediction form -->
+      <div class="predict-card">
+        <h2>Predict Quantity (XGBoost)</h2>
+        <form id="predict-form">
+          <div class="predict-row">
+            <label>Type
+              <select name="type">
+                <option value="import">Import</option>
+                <option value="export">Export</option>
+              </select>
+            </label>
+            <label>Product
+              <input type="text" name="product" required>
+            </label>
+            <label>Country
+              <input type="text" name="country" required>
+            </label>
+          </div>
+
+          <div class="predict-row">
+            <label>Value (USD)
+              <input type="number" step="0.01" name="valueusd" required>
+            </label>
+            <label>Current Quantity
+              <input type="number" step="0.01" name="quantity" required>
+            </label>
+          </div>
+
+          <div class="predict-row">
+            <label>Quantity Lag 1
+              <input type="number" step="0.01" name="quantity_lag1" required>
+            </label>
+            <label>Value Lag 1
+              <input type="number" step="0.01" name="value_lag1" required>
+            </label>
+            <label>Quantity Rolling Mean
+              <input type="number" step="0.01" name="quantity_rolling" required>
+            </label>
+          </div>
+
+          <div class="predict-row">
+            <label>Country Quantity Median
+              <input type="number" step="0.01" name="country_qty_median" required>
+            </label>
+            <label>Product Value Median
+              <input type="number" step="0.01" name="product_val_median" required>
+            </label>
+          </div>
+
+          <button type="submit">Predict</button>
+        </form>
+        <div id="predict-result"></div>
+      </div>
+
+      <div class="content-row">
+        <div class="table-wrapper">
+          <h2>By Country</h2>
+          <div class="table-body-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Country</th>
+                  <th>Quantity</th>
+                  <th>Value (US$M)</th>
+                </tr>
+              </thead>
+              <tbody id="countryTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="right-column">
+          <div class="chart-wrapper">
+            <h2>Top Countries (Quantity)</h2>
+            <canvas id="comparisonChart"></canvas>
+          </div>
+
+          <div class="chart-wrapper">
+            <h2>Category Quantity: Now vs 2026</h2>
+            <canvas id="valueCompareChart"></canvas>
+          </div>
+
+          <div class="chart-wrapper small-chart">
+            <h2>2026 Value Projection (GST impact)</h2>
+            <canvas id="gstPieChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+let chart = null;
+let valueCompareChart = null;
+let gstPie = null;
+
+function formatNumberShort(x) {
+  if (x === null || x === undefined) return "0";
+  if (x >= 1e6) return (x / 1e6).toFixed(2) + "M";
+  if (x >= 1e3) return (x / 1e3).toFixed(1) + "K";
+  return x.toLocaleString();
+}
+
+function runSearch(name, type) {
+  const msg = document.getElementById('message');
+  const gstInfo = document.getElementById('gstInfo');
+
+  if (!name) {
+    msg.textContent = "Please enter a product name.";
+    gstInfo.textContent = "";
+    return;
+  }
+
+  msg.textContent = "Loading...";
+  gstInfo.textContent = "";
+
+  fetch(`/api/search_product?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`)
+    .then(res => res.json())
+    .then(data => {
+      if (data.message === "No records found") {
+        msg.textContent = `No records found for "${name}" in ${type}.`;
+        gstInfo.textContent = "";
+        document.getElementById('totalQuantity').textContent = "–";
+        document.getElementById('totalValue').textContent = "–";
+        document.getElementById('countryTableBody').innerHTML = "";
+        if (chart) chart.destroy();
+        if (gstPie) gstPie.destroy();
+        return;
+      }
+
+      msg.textContent = `Showing results for ${data.product} (${data.type}).`;
+
+      const gstRate = (data.gst_rate || 0) * 100;
+      const rateText = `${gstRate.toFixed(1)}%`;
+      const isLow = gstRate <= 5.1;
+      gstInfo.innerHTML =
+        `Applied GST rate for this product: <span class="gst-badge ${isLow ? 'gst-low' : 'gst-high'}">${rateText}</span> (used to project 2026 values).`;
+
+      document.getElementById('totalQuantity').textContent =
+        formatNumberShort(data.summary.total_quantity);
+      document.getElementById('totalValue').textContent =
+        data.summary.total_value_usd.toFixed(2);
+
+      const tbody = document.getElementById('countryTableBody');
+      tbody.innerHTML = "";
+      data.summary.by_country.forEach(row => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.country}</td>
+          <td>${formatNumberShort(row.quantity)}</td>
+          <td>${row.value_usd.toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      const labels = data.series.map(s => s.country);
+      const quantities = data.series.map(s => s.quantity);
+
+      const ctx = document.getElementById('comparisonChart').getContext('2d');
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Quantity',
+            data: quantities,
+            backgroundColor: 'rgba(54, 162, 235, 0.6)'
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: false },
+            tooltip: { enabled: true }
+          },
+          scales: {
+            x: { ticks: { autoSkip: false } },
+            y: { beginAtZero: true }
+          }
+        }
+      });
+
+      const proj = data.gst_projection_2026 || [];
+      proj.sort((a, b) => b.value_usd_2026 - a.value_usd_2026);
+      const topProj = proj.slice(0, 5);
+
+      const pieLabels = topProj.map(p => p.country);
+      const pieValues = topProj.map(p => p.value_usd_2026);
+
+      const pieCtx = document.getElementById('gstPieChart').getContext('2d');
+      if (gstPie) gstPie.destroy();
+      gstPie = new Chart(pieCtx, {
+        type: 'pie',
+        data: {
+          labels: pieLabels,
+          datasets: [{
+            data: pieValues,
+            backgroundColor: [
+              'rgba(59, 130, 246, 0.7)',
+              'rgba(16, 185, 129, 0.7)',
+              'rgba(234, 179, 8, 0.7)',
+              'rgba(239, 68, 68, 0.7)',
+              'rgba(147, 51, 234, 0.7)'
+            ],
+            borderColor: '#020617',
+            borderWidth: 1
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              position: 'bottom',
+              labels: { color: '#e5e7eb' }
+            },
+            tooltip: {
+              callbacks: {
+                label: ctx => {
+                  const val = ctx.parsed;
+                  return `${ctx.label}: ${val.toFixed(2)} US$M (projected 2026)`;
+                }
+              }
+            }
+          }
+        }
+      });
+    })
+    .catch(err => {
+      console.error(err);
+      msg.textContent = "Error fetching data.";
+      gstInfo.textContent = "";
+    });
+}
+
+function loadCategorySummary(type, selectedCategory = null) {
+  fetch(`/api/category_summary?type=${encodeURIComponent(type)}`)
+    .then(res => res.json())
+    .then(data => {
+      const cats = data.categories || [];
+
+      const filtered = selectedCategory
+        ? cats.filter(c => c.category === selectedCategory)
+        : cats;
+
+      const labels = filtered.map(c => c.category);
+      const qtyNow = filtered.map(c => c.quantity_now);
+      const qty2026 = filtered.map(c => c.quantity_2026);
+
+      const vctx = document.getElementById('valueCompareChart').getContext('2d');
+      if (valueCompareChart) valueCompareChart.destroy();
+      valueCompareChart = new Chart(vctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Current Quantity (combined)',
+              data: qtyNow,
+              backgroundColor: 'rgba(59, 130, 246, 0.7)'
+            },
+            {
+              label: '2026 Quantity (combined)',
+              data: qty2026,
+              backgroundColor: 'rgba(16, 185, 129, 0.7)'
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            tooltip: {
+              callbacks: {
+                label: ctx => `${ctx.dataset.label}: ${ctx.parsed.toFixed(0)}`
+              }
+            }
+          },
+          scales: {
+            x: { ticks: { autoSkip: false } },
+            y: { beginAtZero: true }
+          }
+        }
+      });
+    });
+}
+
+document.getElementById('searchBtn').addEventListener('click', () => {
+  const name = document.getElementById('productInput').value.trim();
+  const type = document.getElementById('typeSelect').value;
+  runSearch(name, type);
+  loadCategorySummary(type);
+});
+
+const categoryList = document.getElementById('categoryList');
+categoryList.addEventListener('click', e => {
+  const li = e.target.closest('li');
+  if (!li) return;
+
+  categoryList.querySelectorAll('li').forEach(el => el.classList.remove('active'));
+  li.classList.add('active');
+
+  const cat = li.dataset.category || null;
+  const type = document.getElementById('typeSelect').value || "import";
+  loadCategorySummary(type, cat);
+});
+
+// XGBoost prediction form submit
+document.getElementById('predict-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const data = new FormData(form);
+  const resultBox = document.getElementById('predict-result');
+  resultBox.textContent = 'Predicting...';
+
+  try {
+    const res = await fetch('/predict_quantity', {
+      method: 'POST',
+      body: data
+    });
+
+    const result = await res.json();
+    console.log('PREDICT RESPONSE', result);
+
+    if (!res.ok || result.error) {
+      resultBox.textContent = 'Error: ' + (result.error || ('HTTP ' + res.status));
+      return;
+    }
+
+    resultBox.textContent =
+      'Predicted Quantity: ' + Number(result.predicted_quantity).toFixed(2);
+  } catch (err) {
+    console.error('PREDICT FETCH ERROR', err);
+    resultBox.textContent = 'Error calling prediction API.';
+  }
+});
+
+window.addEventListener('load', () => {
+  document.getElementById('productInput').value = "rice";
+  document.getElementById('typeSelect').value = "import";
+  runSearch("rice", "import");
+  loadCategorySummary("import");
+});
+</script>
+</body>
+</html>
